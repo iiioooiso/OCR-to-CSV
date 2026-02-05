@@ -43,7 +43,8 @@ except ImportError:
     PYMUPDF_AVAILABLE = False
 
 # ---------------- CONFIG ----------------
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="UC to Excel Converter", layout="wide", page_icon="📋")
 st.title("UC to Excel Converter")
@@ -52,9 +53,18 @@ st.markdown("Professional extraction tool for Utilisation Certificate documents"
 # ---------------- LOAD OCR ----------------
 @st.cache_resource
 def load_ocr():
-    return easyocr.Reader(['en'], gpu=False)
+    try:
+        return easyocr.Reader(['en'], gpu=False)
+    except Exception as e:
+        st.error(f"Failed to load OCR model: {str(e)}")
+        logger.error(f"OCR loading error: {str(e)}", exc_info=True)
+        return None
 
 ocr = load_ocr()
+
+if ocr is None:
+    st.error("OCR model failed to load. Please refresh the page or contact support.")
+    st.stop()
 
 # ---------------- STRUCTURED UC DOCUMENT EXTRACTION ----------------
 def extract_uc_document_complete(pdf_path, page_num, image):
@@ -65,37 +75,53 @@ def extract_uc_document_complete(pdf_path, page_num, image):
     import json
     import re
     
-    structured_data = {
-        "heading": "",
-        "two_column_data": [],
-        "sentences": [],
-        "receipt_details": [],
-        "expenditure_details": []
-    }
+    try:
+        structured_data = {
+            "heading": "",
+            "two_column_data": [],
+            "sentences": [],
+            "receipt_details": [],
+            "expenditure_details": []
+        }
+        
+        # Convert PIL image to numpy array
+        try:
+            img_array = np.array(image)
+        except Exception as e:
+            logger.error(f"Image conversion error: {str(e)}")
+            st.error(f"Failed to convert image: {str(e)}")
+            return None
+        
+        # Run OCR
+        try:
+            result = ocr.readtext(img_array)
+        except Exception as e:
+            logger.error(f"OCR processing error: {str(e)}")
+            st.error(f"OCR failed: {str(e)}")
+            return None
+        
+        if not result:
+            return None
+        
+        # Sort OCR results by Y position (top to bottom)
+        sorted_results = sorted(result, key=lambda x: min([p[1] for p in x[0]]))
+        
+        # Extract all text lines
+        all_lines = []
+        for detection in sorted_results:
+            text = detection[1].strip()
+            if text:
+                all_lines.append(text)
+        
+        # DEBUG: Show what OCR extracted (first 30 lines)
+        with st.expander("Debug: OCR Extracted Lines", expanded=False):
+            for i, line in enumerate(all_lines[:30]):
+                st.text(f"{i}: {line}")
     
-    # Convert PIL image to numpy array
-    img_array = np.array(image)
-    
-    # Run OCR
-    result = ocr.readtext(img_array)
-    
-    if not result:
+    except Exception as e:
+        logger.error(f"Extraction error: {str(e)}", exc_info=True)
+        st.error(f"Error during extraction: {str(e)}")
         return None
-    
-    # Sort OCR results by Y position (top to bottom)
-    sorted_results = sorted(result, key=lambda x: min([p[1] for p in x[0]]))
-    
-    # Extract all text lines
-    all_lines = []
-    for detection in sorted_results:
-        text = detection[1].strip()
-        if text:
-            all_lines.append(text)
-    
-    # DEBUG: Show what OCR extracted (first 30 lines)
-    with st.expander("Debug: OCR Extracted Lines", expanded=False):
-        for i, line in enumerate(all_lines[:30]):
-            st.text(f"{i}: {line}")
     
     # 1. Extract Heading (look for "Utilisation Certificate")
     for i, line in enumerate(all_lines[:5]):  # Check first 5 lines
@@ -586,48 +612,84 @@ with col2:
 if uploaded_pdf:
     st.divider()
     
-    with st.spinner("Processing document..."):
-        # Save PDF to temporary file (required for Camelot)
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(uploaded_pdf.read())
-            tmp_pdf_path = tmp_file.name
-        
-        # Get number of pages
-        pdf_bytes = open(tmp_pdf_path, 'rb').read()
-        
-        # Convert PDF to images
-        images = convert_from_bytes(pdf_bytes, dpi=dpi)
-        num_pages = len(images)
-        
-        st.success(f"Document loaded: {num_pages} page(s) detected")
-        
-        page_data = {}  # Store structured data per page
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for i, img in enumerate(images):
-            page_num = i + 1
-            status_text.text(f"Processing page {page_num} of {num_pages}...")
-            progress_bar.progress(page_num / num_pages)
+    try:
+        with st.spinner("Processing document..."):
+            # Save PDF to temporary file (required for Camelot)
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                    tmp_file.write(uploaded_pdf.read())
+                    tmp_pdf_path = tmp_file.name
+            except Exception as e:
+                st.error(f"Failed to save PDF: {str(e)}")
+                logger.error(f"PDF save error: {str(e)}", exc_info=True)
+                st.stop()
             
-            # Extract structured UC document
-            structured_data = extract_uc_document_complete(tmp_pdf_path, page_num, img)
+            # Get number of pages
+            try:
+                pdf_bytes = open(tmp_pdf_path, 'rb').read()
+            except Exception as e:
+                st.error(f"Failed to read PDF: {str(e)}")
+                logger.error(f"PDF read error: {str(e)}", exc_info=True)
+                if os.path.exists(tmp_pdf_path):
+                    os.unlink(tmp_pdf_path)
+                st.stop()
             
-            if structured_data:
-                # Convert to Excel format blocks
-                blocks = convert_uc_to_excel_format(structured_data)
+            # Convert PDF to images
+            try:
+                images = convert_from_bytes(pdf_bytes, dpi=dpi)
+                num_pages = len(images)
+            except Exception as e:
+                st.error(f"Failed to convert PDF to images: {str(e)}")
+                st.info("This might be due to missing poppler-utils. Check deployment logs.")
+                logger.error(f"PDF conversion error: {str(e)}", exc_info=True)
+                if os.path.exists(tmp_pdf_path):
+                    os.unlink(tmp_pdf_path)
+                st.stop()
+            
+            st.success(f"Document loaded: {num_pages} page(s) detected")
+            
+            page_data = {}  # Store structured data per page
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, img in enumerate(images):
+                page_num = i + 1
+                status_text.text(f"Processing page {page_num} of {num_pages}...")
+                progress_bar.progress(page_num / num_pages)
                 
-                if blocks:
-                    page_data[f"Page_{page_num}"] = {
-                        'structured': structured_data,
-                        'blocks': blocks
-                    }
-        
-        progress_bar.empty()
-        status_text.empty()
-        
-        # Clean up temp file
-        os.unlink(tmp_pdf_path)
+                try:
+                    # Extract structured UC document
+                    structured_data = extract_uc_document_complete(tmp_pdf_path, page_num, img)
+                    
+                    if structured_data:
+                        # Convert to Excel format blocks
+                        blocks = convert_uc_to_excel_format(structured_data)
+                        
+                        if blocks:
+                            page_data[f"Page_{page_num}"] = {
+                                'structured': structured_data,
+                                'blocks': blocks
+                            }
+                except Exception as e:
+                    st.warning(f"Error processing page {page_num}: {str(e)}")
+                    logger.error(f"Page {page_num} processing error: {str(e)}", exc_info=True)
+                    continue
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            # Clean up temp file
+            try:
+                if os.path.exists(tmp_pdf_path):
+                    os.unlink(tmp_pdf_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file: {str(e)}")
+    
+    except Exception as e:
+        st.error(f"Unexpected error during processing: {str(e)}")
+        logger.error(f"Main processing error: {str(e)}", exc_info=True)
+        st.info("Please try again or contact support if the issue persists.")
+        st.stop()
     
     if not page_data:
         st.error("No content detected in the document")
@@ -639,99 +701,122 @@ if uploaded_pdf:
     st.divider()
     st.subheader("Extracted Document Structure")
     
-    tab_list = st.tabs([f"Page {i+1}" for i in range(len(page_data))])
-    
-    for idx, (page_name, data) in enumerate(page_data.items()):
-        with tab_list[idx]:
-            structured = data['structured']
-            
-            # Show JSON structure
-            with st.expander("View JSON Structure", expanded=False):
-                st.json(structured)
-            
-            # Show formatted blocks
-            for block in data['blocks']:
-                st.markdown(f"**{block['label']}**")
+    try:
+        tab_list = st.tabs([f"Page {i+1}" for i in range(len(page_data))])
+        
+        for idx, (page_name, data) in enumerate(page_data.items()):
+            with tab_list[idx]:
+                structured = data['structured']
+                
+                # Show JSON structure
+                with st.expander("View JSON Structure", expanded=False):
+                    st.json(structured)
+                
+                # Show formatted blocks
+                for block in data['blocks']:
+                    st.markdown(f"**{block['label']}**")
                 st.dataframe(block['df'], use_container_width=True, height=min(len(block['df']) * 35 + 38, 400))
                 st.markdown("---")
+                    st.markdown(f"**{block['label']}**")
+                    st.dataframe(block['df'], use_container_width=True, height=min(len(block['df']) * 35 + 38, 400))
+                    st.markdown("---")
+    except Exception as e:
+        st.error(f"Error displaying results: {str(e)}")
+        logger.error(f"Display error: {str(e)}", exc_info=True)
     
     # Pre-generate Excel file (to avoid UI hanging)
-    excel_buffer = BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        for page_name, data in page_data.items():
-            current_row = 0
-            
-            for block in data['blocks']:
-                df = block['df']
+    try:
+        excel_buffer = BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            for page_name, data in page_data.items():
+                current_row = 0
                 
-                # Write block label
-                label_df = pd.DataFrame([[f"=== {block['label']} ==="]])
-                label_df.to_excel(
-                    writer,
-                    sheet_name=page_name,
-                    index=False,
-                    header=False,
-                    startrow=current_row
-                )
-                current_row += 1
+                for block in data['blocks']:
+                    df = block['df']
+                    
+                    # Write block label
+                    label_df = pd.DataFrame([[f"=== {block['label']} ==="]])
+                    label_df.to_excel(
+                        writer,
+                        sheet_name=page_name,
+                        index=False,
+                        header=False,
+                        startrow=current_row
+                    )
+                    current_row += 1
+                    
+                    # Write block data
+                    df.to_excel(
+                        writer,
+                        sheet_name=page_name,
+                        index=False,
+                        header=True,
+                        startrow=current_row
+                    )
+                    current_row += len(df) + 2  # +2 for header and blank row
                 
-                # Write block data
-                df.to_excel(
-                    writer,
-                    sheet_name=page_name,
-                    index=False,
-                    header=True,
-                    startrow=current_row
-                )
-                current_row += len(df) + 2  # +2 for header and blank row
-            
-            # Enable text wrapping
-            worksheet = writer.sheets[page_name]
-            for row in worksheet.iter_rows():
-                for cell in row:
-                    cell.alignment = cell.alignment.copy(wrap_text=True)
-    
-    excel_buffer.seek(0)
+                # Enable text wrapping
+                worksheet = writer.sheets[page_name]
+                for row in worksheet.iter_rows():
+                    for cell in row:
+                        cell.alignment = cell.alignment.copy(wrap_text=True)
+        
+        excel_buffer.seek(0)
+    except Exception as e:
+        st.error(f"Failed to generate Excel file: {str(e)}")
+        logger.error(f"Excel generation error: {str(e)}", exc_info=True)
+        excel_buffer = None
     
     # Export to Excel/CSV
     st.divider()
     st.subheader("Export Options")
     
     # Pre-generate CSV data (to avoid UI hanging on button click)
-    all_rows = []
-    for data in page_data.values():
-        for block in data['blocks']:
-            # Add block label
-            all_rows.append([f"=== {block['label']} ==="])
-            # Add block data
-            df = block['df']
-            for _, row in df.iterrows():
-                all_rows.append(row.tolist())
-            # Add blank row
-            all_rows.append([])
-    
-    combined_df = pd.DataFrame(all_rows)
-    csv_data = combined_df.to_csv(index=False, header=False)
+    try:
+        all_rows = []
+        for data in page_data.values():
+            for block in data['blocks']:
+                # Add block label
+                all_rows.append([f"=== {block['label']} ==="])
+                # Add block data
+                df = block['df']
+                for _, row in df.iterrows():
+                    all_rows.append(row.tolist())
+                # Add blank row
+                all_rows.append([])
+        
+        combined_df = pd.DataFrame(all_rows)
+        csv_data = combined_df.to_csv(index=False, header=False)
+    except Exception as e:
+        st.error(f"Failed to generate CSV: {str(e)}")
+        logger.error(f"CSV generation error: {str(e)}", exc_info=True)
+        csv_data = None
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.download_button(
-            label="Download Excel (Multi-sheet)",
-            data=excel_buffer,
-            file_name=f"{uploaded_pdf.name.replace('.pdf', '')}_UC_extracted.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+        if excel_buffer:
+            st.download_button(
+                label="Download Excel (Multi-sheet)",
+                data=excel_buffer,
+                file_name=f"{uploaded_pdf.name.replace('.pdf', '')}_UC_extracted.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        else:
+            st.error("Excel export unavailable")
     
     with col2:
-        st.download_button(
-            label="Download CSV (Combined)",
-            data=csv_data,
-            file_name=f"{uploaded_pdf.name.replace('.pdf', '')}_UC_extracted.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+        if csv_data:
+            st.download_button(
+                label="Download CSV (Combined)",
+                data=csv_data,
+                file_name=f"{uploaded_pdf.name.replace('.pdf', '')}_UC_extracted.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        else:
+            st.error("CSV export unavailable")
 
 else:
     st.info("Upload a UC document PDF to begin extraction")
