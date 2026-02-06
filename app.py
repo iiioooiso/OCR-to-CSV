@@ -53,8 +53,18 @@ st.markdown("Professional extraction tool for Utilisation Certificate documents"
 # ---------------- LOAD OCR ----------------
 @st.cache_resource
 def load_ocr():
+    """Load OCR with optimized settings for faster processing"""
     try:
-        return easyocr.Reader(['en'], gpu=False)
+        # Use GPU if available, optimize for speed
+        return easyocr.Reader(
+            ['en'], 
+            gpu=False,
+            model_storage_directory=None,
+            download_enabled=True,
+            detector=True,
+            recognizer=True,
+            verbose=False
+        )
     except Exception as e:
         st.error(f"Failed to load OCR model: {str(e)}")
         logger.error(f"OCR loading error: {str(e)}", exc_info=True)
@@ -71,6 +81,7 @@ def extract_uc_document_complete(pdf_path, page_num, image):
     """
     Complete UC document extraction combining OCR and Camelot.
     Returns structured JSON with all 5 sections.
+    IMPROVED: Hardcoded keys, better value extraction, complete row extraction.
     """
     import json
     import re
@@ -84,6 +95,16 @@ def extract_uc_document_complete(pdf_path, page_num, image):
             "expenditure_details": []
         }
         
+        # HARDCODED KEYS - Only the 6 main fields in UC documents
+        REQUIRED_KEYS = [
+            "Deposit Work ID",
+            "Name of Work",
+            "User Department",
+            "Administrative Approval No",
+            "Administrative Approval Date",
+            "AA Amount in Rupees"
+        ]
+        
         # Convert PIL image to numpy array
         try:
             img_array = np.array(image)
@@ -92,9 +113,20 @@ def extract_uc_document_complete(pdf_path, page_num, image):
             st.error(f"Failed to convert image: {str(e)}")
             return None
         
-        # Run OCR
+        # Run OCR with optimized settings for speed
         try:
-            result = ocr.readtext(img_array)
+            # Use lower confidence threshold and batch processing for speed
+            result = ocr.readtext(
+                img_array,
+                detail=1,  # Get bounding boxes
+                paragraph=False,  # Don't merge into paragraphs
+                min_size=10,  # Minimum text size
+                text_threshold=0.6,  # Lower threshold for faster processing
+                low_text=0.3,
+                link_threshold=0.3,
+                canvas_size=2560,  # Limit canvas size for speed
+                mag_ratio=1.0
+            )
         except Exception as e:
             logger.error(f"OCR processing error: {str(e)}")
             st.error(f"OCR failed: {str(e)}")
@@ -106,17 +138,30 @@ def extract_uc_document_complete(pdf_path, page_num, image):
         # Sort OCR results by Y position (top to bottom)
         sorted_results = sorted(result, key=lambda x: min([p[1] for p in x[0]]))
         
-        # Extract all text lines
+        # Extract all text lines with position info
         all_lines = []
         for detection in sorted_results:
             text = detection[1].strip()
+            box = detection[0]
+            y_pos = min([p[1] for p in box])
             if text:
-                all_lines.append(text)
+                all_lines.append({'text': text, 'y': y_pos})
         
-        # DEBUG: Show what OCR extracted (first 30 lines)
+        # Create text-only list for easier processing
+        text_lines = [line['text'] for line in all_lines]
+        
+        # Build full text for global searching
+        full_text = '\n'.join(text_lines)
+        
+        # DEBUG: Show what OCR extracted
         with st.expander("Debug: OCR Extracted Lines", expanded=False):
-            for i, line in enumerate(all_lines[:30]):
+            for i, line in enumerate(text_lines[:50]):
                 st.text(f"{i}: {line}")
+            
+            # Show full text for pattern searching
+            st.markdown("---")
+            st.markdown("**Full Text (first 1000 chars):**")
+            st.text(full_text[:1000])
     
     except Exception as e:
         logger.error(f"Extraction error: {str(e)}", exc_info=True)
@@ -124,98 +169,348 @@ def extract_uc_document_complete(pdf_path, page_num, image):
         return None
     
     # 1. Extract Heading (look for "Utilisation Certificate")
-    for i, line in enumerate(all_lines[:5]):  # Check first 5 lines
-        if "Utilisation" in line or "Certificate" in line:
+    for i, line in enumerate(text_lines[:5]):
+        if "Utilisation" in line or "Certificate" in line or "UTILISATION" in line or "CERTIFICATE" in line:
             structured_data["heading"] = line
             break
     
-    # 2. Extract two-column data (lines with colons before table sections)
-    # Look for specific patterns
-    table_section_reached = False
-    i = 0
+    # 2. Extract two-column data using HARDCODED KEYS with PRECISE matching
+    # Create a dictionary to store found values
+    found_keys = {}
     
-    while i < len(all_lines):
-        line = all_lines[i]
-        
-        # Stop when we reach numbered sentences or table sections
-        if re.match(r'^\d+\)', line):
-            table_section_reached = True
-            i += 1
-            continue
-        
-        if "Receipt Details" in line or "Expenditure Details" in line:
-            table_section_reached = True
-            i += 1
-            continue
-        
-        # Only process lines before table sections
-        if table_section_reached:
-            i += 1
-            continue
-        
-        # Look for label: value pattern
-        if ':' in line:
-            parts = line.split(':', 1)
-            if len(parts) == 2:
-                label = parts[0].strip()
-                value = parts[1].strip()
-                
-                # Filter out noise
-                skip_labels = ["Sign of DDO", "Name of DDO", "Receipt Details", "Expenditure Details"]
-                if label not in skip_labels and len(label) > 2:
-                    # Check if value is empty and next line might be the value
-                    if not value and i + 1 < len(all_lines):
-                        next_line = all_lines[i + 1].strip()
-                        # If next line doesn't have colon and isn't a number, it might be the value
-                        if ':' not in next_line and not re.match(r'^\d+\)', next_line):
-                            value = next_line
-                            i += 1  # Skip the next line since we used it
-                    
-                    structured_data["two_column_data"].append({
-                        "label": label,
-                        "value": value
-                    })
-        
-        # Also look for common UC document fields even without colon
-        # Pattern: "Label" followed by value on same or next line
-        else:
-            # Check for known labels
-            known_labels = [
-                "Deposit Work ID", "Name of Work", "User Department", 
-                "Administrative Approval No", "Administrative Approval Date",
-                "AA Amount in Rupees", "Sanctioned Amount"
-            ]
+    # SPECIAL HANDLING: Deposit Work ID has a specific format pattern
+    # Pattern: numbers/letters/numbers (e.g., 2312/ZD37/01354)
+    work_id_pattern = r'\b\d{3,5}[/\\][A-Z]{2,4}\d*[/\\]\d{3,6}\b'
+    
+    # Stop index for field extraction (before statements)
+    stop_index = len(text_lines)
+    for i, line in enumerate(text_lines):
+        if re.match(r'^\d+\)\s+', line):
+            stop_index = i
+            break
+    
+    # Extract fields in specific order with targeted patterns
+    
+    # 1. DEPOSIT WORK ID - Search for pattern anywhere in text
+    for i in range(stop_index):
+        line = text_lines[i]
+        if "deposit work id" in line.lower() or "work id" in line.lower():
+            # Search this line and next 2 lines for the pattern
+            search_text = line
+            for j in range(i + 1, min(i + 3, stop_index)):
+                search_text += " " + text_lines[j]
             
-            for known_label in known_labels:
-                if known_label.lower() in line.lower():
-                    # Extract value from same line or next line
-                    value = line.replace(known_label, '').strip()
-                    value = value.lstrip(':').strip()
-                    
-                    if not value and i + 1 < len(all_lines):
-                        next_line = all_lines[i + 1].strip()
-                        if ':' not in next_line and not re.match(r'^\d+\)', next_line):
-                            value = next_line
-                            i += 1  # Skip next line
-                    
-                    if value:
-                        structured_data["two_column_data"].append({
-                            "label": known_label,
-                            "value": value
-                        })
+            match = re.search(work_id_pattern, search_text)
+            if match:
+                found_keys["Deposit Work ID"] = match.group(0)
+                break
+    
+    # If not found with label, search entire text for the pattern
+    if "Deposit Work ID" not in found_keys:
+        match = re.search(work_id_pattern, full_text[:full_text.find('1)') if '1)' in full_text else len(full_text)])
+        if match:
+            found_keys["Deposit Work ID"] = match.group(0)
+    
+    # Additional fallback: Search all lines for Work ID pattern
+    if "Deposit Work ID" not in found_keys:
+        for line in text_lines[:stop_index]:
+            match = re.search(work_id_pattern, line)
+            if match:
+                found_keys["Deposit Work ID"] = match.group(0)
+                break
+    
+    # 2. NAME OF WORK - Look for the label and collect full multi-line value
+    name_of_work_found = False
+    for i in range(stop_index):
+        line = text_lines[i]
+        if "name of work" in line.lower() and not name_of_work_found:
+            # Extract value after colon
+            if ':' in line:
+                value = line.split(':', 1)[1].strip()
+            else:
+                value = ""
+            
+            # Collect continuation lines
+            full_value = value
+            j = i + 1
+            while j < stop_index:
+                next_line = text_lines[j].strip()
+                
+                # Stop if we hit another key (but not if it's part of the work name)
+                is_key_line = False
+                for k in REQUIRED_KEYS:
+                    if k != "Name of Work" and k.lower() in next_line.lower() and ':' in next_line:
+                        is_key_line = True
+                        break
+                
+                if is_key_line:
                     break
+                
+                # Stop if we hit a Work ID pattern
+                if re.search(work_id_pattern, next_line):
+                    break
+                
+                # Stop if line is empty or very short
+                if not next_line or len(next_line) < 3:
+                    j += 1
+                    continue
+                
+                # Stop if we hit a statement
+                if re.match(r'^\d+\)', next_line):
+                    break
+                
+                # Add to value
+                full_value += " " + next_line
+                j += 1
+            
+            if full_value.strip():
+                found_keys["Name of Work"] = full_value.strip()
+                name_of_work_found = True
+            break
+    
+    # 3. USER DEPARTMENT - Look for the label
+    for i in range(stop_index):
+        line = text_lines[i]
+        if "user department" in line.lower() or "department" in line.lower():
+            # Extract value after colon
+            if ':' in line:
+                value = line.split(':', 1)[1].strip()
+            else:
+                value = ""
+            
+            # Check next line if empty
+            if (not value or len(value) < 3) and i + 1 < stop_index:
+                next_line = text_lines[i + 1].strip()
+                if next_line and not any(k.lower() in next_line.lower() for k in REQUIRED_KEYS):
+                    value = next_line
+            
+            if value.strip():
+                found_keys["User Department"] = value.strip()
+            break
+    
+    # 4. ADMINISTRATIVE APPROVAL NO - Look for specific pattern
+    approval_no_pattern = r'[A-Z]{2,4}/\d{4}/\d{1,2}/[A-Z\.\d/\(\)]+' 
+    for i in range(stop_index):
+        line = text_lines[i]
+        if "administrative approval no" in line.lower() or "approval no" in line.lower():
+            # Extract value after colon
+            if ':' in line:
+                value = line.split(':', 1)[1].strip()
+            else:
+                value = ""
+            
+            # Check next line if empty
+            if (not value or len(value) < 3) and i + 1 < stop_index:
+                next_line = text_lines[i + 1].strip()
+                if next_line and not any(k.lower() in next_line.lower() for k in REQUIRED_KEYS):
+                    value = next_line
+            
+            # Validate it looks like an approval number (not a date or amount)
+            if value and not value.startswith('Rs') and not re.match(r'^\d{2}/\d{2}/\d{4}', value):
+                found_keys["Administrative Approval No"] = value.strip()
+            break
+    
+    # If not found, search for the pattern
+    if "Administrative Approval No" not in found_keys:
+        match = re.search(approval_no_pattern, full_text[:full_text.find('1)') if '1)' in full_text else len(full_text)])
+        if match:
+            found_keys["Administrative Approval No"] = match.group(0)
+    
+    # 5. ADMINISTRATIVE APPROVAL DATE - Look for date pattern
+    date_pattern = r'\b\d{2}/\d{2}/\d{4}\b'
+    for i in range(stop_index):
+        line = text_lines[i]
+        if "administrative approval date" in line.lower() or "approval date" in line.lower():
+            # Extract value after colon
+            if ':' in line:
+                value = line.split(':', 1)[1].strip()
+            else:
+                value = ""
+            
+            # Check next line if empty
+            if (not value or len(value) < 3) and i + 1 < stop_index:
+                next_line = text_lines[i + 1].strip()
+                if next_line:
+                    value = next_line
+            
+            # Extract date pattern
+            match = re.search(date_pattern, value)
+            if match:
+                found_keys["Administrative Approval Date"] = match.group(0) + " (dd/mm/yyyy)"
+            break
+    
+    # If not found, search for date near "approval date" text
+    if "Administrative Approval Date" not in found_keys:
+        for i in range(stop_index):
+            if "approval date" in text_lines[i].lower():
+                search_text = text_lines[i]
+                if i + 1 < stop_index:
+                    search_text += " " + text_lines[i + 1]
+                match = re.search(date_pattern, search_text)
+                if match:
+                    found_keys["Administrative Approval Date"] = match.group(0) + " (dd/mm/yyyy)"
+                    break
+    
+    # Additional fallback: Search all lines for date pattern (dd/mm/yyyy format)
+    if "Administrative Approval Date" not in found_keys:
+        for line in text_lines[:stop_index]:
+            # Look for date that's NOT in a statement
+            if not re.match(r'^\d+\)', line):
+                match = re.search(date_pattern, line)
+                if match:
+                    # Make sure it's not in the statements section
+                    date_value = match.group(0)
+                    # Check if this line also contains "date" keyword
+                    if "date" in line.lower() or text_lines.index(line) < 10:
+                        found_keys["Administrative Approval Date"] = date_value + " (dd/mm/yyyy)"
+                        break
+    
+    # 6. AA AMOUNT IN RUPEES - Look for amount pattern
+    amount_pattern = r'Rs\.?\s*\d{5,}'
+    for i in range(stop_index):
+        line = text_lines[i]
+        if "aa amount" in line.lower() or "amount in rupees" in line.lower():
+            # Extract value after colon
+            if ':' in line:
+                value = line.split(':', 1)[1].strip()
+            else:
+                value = ""
+            
+            # Check next line if empty
+            if (not value or len(value) < 3) and i + 1 < stop_index:
+                next_line = text_lines[i + 1].strip()
+                if next_line:
+                    value = next_line
+            
+            # Extract amount pattern
+            match = re.search(amount_pattern, value)
+            if match:
+                found_keys["AA Amount in Rupees"] = match.group(0)
+            break
+    
+    # If not found, search for "Rs. 15000000" pattern near "AA Amount" text
+    if "AA Amount in Rupees" not in found_keys:
+        for i in range(stop_index):
+            if "aa amount" in text_lines[i].lower() or "amount in rupees" in text_lines[i].lower():
+                search_text = text_lines[i]
+                if i + 1 < stop_index:
+                    search_text += " " + text_lines[i + 1]
+                if i + 2 < stop_index:
+                    search_text += " " + text_lines[i + 2]
+                match = re.search(amount_pattern, search_text)
+                if match:
+                    found_keys["AA Amount in Rupees"] = match.group(0)
+                    break
+    
+    # Additional fallback: Search all lines for amount pattern
+    if "AA Amount in Rupees" not in found_keys:
+        for line in text_lines[:stop_index]:
+            # Look for Rs. followed by large number (5+ digits)
+            match = re.search(amount_pattern, line)
+            if match:
+                amount_value = match.group(0)
+                # Make sure it's a large amount (likely the AA amount, not a small amount)
+                amount_num = int(re.sub(r'[^\d]', '', amount_value))
+                if amount_num >= 1000000:  # At least 10 lakhs
+                    found_keys["AA Amount in Rupees"] = amount_value
+                    break
+    
+    # Add all found keys to structured data in order (ONLY the 6 main fields for UC)
+    # Based on the actual UC format, we only need these 6 fields:
+    UC_MAIN_FIELDS = [
+        "Deposit Work ID",
+        "Name of Work",
+        "User Department",
+        "Administrative Approval No",
+        "Administrative Approval Date",
+        "AA Amount in Rupees"
+    ]
+    
+    for key in UC_MAIN_FIELDS:
+        if key in found_keys:
+            structured_data["two_column_data"].append({
+                "label": key,
+                "value": found_keys[key]
+            })
+        else:
+            # Add empty entry to maintain structure
+            structured_data["two_column_data"].append({
+                "label": key,
+                "value": ""
+            })
+    
+    # 3. Extract ALL sentences (numbered points like "1)", "2)", etc.)
+    # More aggressive extraction to catch all statements
+    statement_lines = []
+    i = 0
+    while i < len(text_lines):
+        line = text_lines[i]
         
-        i += 1
-    
-    # 3. Extract sentences (numbered points like "1)", "2)", etc.)
-    for line in all_lines:
         # Match lines starting with number followed by )
-        if re.match(r'^\d+\)', line):
-            structured_data["sentences"].append(line)
+        match = re.match(r'^(\d+)\)\s*(.+)', line)
+        if match:
+            statement_num = match.group(1)
+            statement_text = match.group(2).strip()
+            
+            # Collect continuation lines (lines that don't start with number or key)
+            full_statement = statement_text
+            j = i + 1
+            while j < len(text_lines):
+                next_line = text_lines[j].strip()
+                
+                # Stop if we hit another numbered statement, table section, or key
+                if re.match(r'^\d+\)', next_line):
+                    break
+                if "Receipt Details" in next_line or "Expenditure Details" in next_line:
+                    break
+                if any(k.lower() in next_line.lower() for k in REQUIRED_KEYS):
+                    break
+                
+                # Check if it's a continuation (not a table row)
+                if next_line and not re.match(r'^[\d\s\-/]+$', next_line):
+                    full_statement += " " + next_line
+                    j += 1
+                else:
+                    break
+            
+            statement_lines.append(f"{statement_num}) {full_statement}")
+            i = j
+        else:
+            i += 1
     
-    # 4 & 5. Extract tables using Camelot (LATTICE mode only)
+    structured_data["sentences"] = statement_lines
+    
+    # 4 & 5. Extract tables using Camelot with IMPROVED extraction
     try:
-        tables = camelot.read_pdf(pdf_path, pages=str(page_num), flavor='lattice')
+        # Use both lattice and stream modes for better coverage
+        tables = []
+        
+        # Try lattice first (for bordered tables)
+        try:
+            lattice_tables = camelot.read_pdf(
+                pdf_path, 
+                pages=str(page_num), 
+                flavor='lattice',
+                line_scale=40,  # Detect faint lines
+                copy_text=['v']  # Vertical text
+            )
+            tables.extend(lattice_tables)
+        except Exception as e:
+            logger.warning(f"Lattice extraction failed: {str(e)}")
+        
+        # Try stream mode as fallback (for borderless tables)
+        if len(tables) == 0:
+            try:
+                stream_tables = camelot.read_pdf(
+                    pdf_path, 
+                    pages=str(page_num), 
+                    flavor='stream',
+                    edge_tol=50,  # Tolerance for detecting table edges
+                    row_tol=10    # Tolerance for row detection
+                )
+                tables.extend(stream_tables)
+            except Exception as e:
+                logger.warning(f"Stream extraction failed: {str(e)}")
         
         for table in tables:
             df = table.df
@@ -223,39 +518,41 @@ def extract_uc_document_complete(pdf_path, page_num, image):
             if df.empty:
                 continue
             
-            # Clean the dataframe
+            # Clean the dataframe - but keep ALL rows with any data
             df = df.replace('', pd.NA)
-            df = df.dropna(how='all')  # Remove empty rows
-            df = df.dropna(axis=1, how='all')  # Remove empty columns
+            # Only remove completely empty columns
+            df = df.dropna(axis=1, how='all')
+            
+            # Remove only rows that are completely empty
+            df = df.dropna(how='all')
             df = df.reset_index(drop=True)
             
             if df.empty:
                 continue
             
-            # Detect which table this is by checking the FIRST ROW (header row)
-            # Convert first row to string
+            # Detect which table this is
             if len(df) > 0:
-                first_row_text = ' '.join(df.iloc[0].astype(str).values).lower()
+                # Check first few rows for keywords
+                first_rows_text = ' '.join(df.iloc[:2].astype(str).values.flatten()).lower()
                 
                 # Check for Receipt table keywords
-                if 'date' in first_row_text and 'received' in first_row_text:
+                if ('date' in first_rows_text and 'received' in first_rows_text) or 'receipt' in first_rows_text:
+                    # Keep ALL rows including those with partial data
                     structured_data["receipt_details"] = df.to_dict('records')
                 # Check for Expenditure table keywords
-                elif 'financial' in first_row_text and 'year' in first_row_text:
-                    structured_data["expenditure_details"] = df.to_dict('records')
-                elif 'bill' in first_row_text and 'amount' in first_row_text:
+                elif 'financial' in first_rows_text or 'bill' in first_rows_text or 'expenditure' in first_rows_text or 'remark' in first_rows_text:
+                    # Keep ALL rows - especially important for Remarks column
                     structured_data["expenditure_details"] = df.to_dict('records')
                 else:
-                    # Fallback: check second row or table position
-                    # If we already have receipt details, this must be expenditure
+                    # Fallback logic based on order
                     if structured_data["receipt_details"]:
                         structured_data["expenditure_details"] = df.to_dict('records')
                     else:
-                        # First table is usually receipt
                         structured_data["receipt_details"] = df.to_dict('records')
                         
     except Exception as e:
         st.warning(f"Table extraction warning: {str(e)}")
+        logger.warning(f"Table extraction error: {str(e)}", exc_info=True)
     
     return structured_data
 
@@ -264,6 +561,7 @@ def convert_uc_to_excel_format(structured_data):
     """
     Convert UC structured data to Excel format matching PDF layout.
     Returns list of dataframes for sequential writing.
+    IMPROVED: Better handling of empty cells and remarks column.
     """
     blocks = []
     
@@ -286,31 +584,37 @@ def convert_uc_to_excel_format(structured_data):
             'df': df_two_col
         })
     
-    # Block 3: Sentences
+    # Block 3: Sentences - Keep ALL statements
     if structured_data.get("sentences"):
         rows = [[s] for s in structured_data["sentences"]]
-        df_sentences = pd.DataFrame(rows, columns=['Content'])
+        df_sentences = pd.DataFrame(rows, columns=['Statement'])
         blocks.append({
             'label': 'Statements',
             'df': df_sentences
         })
     
-    # Block 4: Receipt Details
+    # Block 4: Receipt Details - Keep rows with at least some data
     if structured_data.get("receipt_details"):
         df_receipt = pd.DataFrame(structured_data["receipt_details"])
-        # Clean up the dataframe
-        df_receipt = df_receipt.replace('', pd.NA).dropna(how='all').dropna(axis=1, how='all')
+        # Only remove completely empty columns, keep rows with partial data
+        df_receipt = df_receipt.dropna(axis=1, how='all')
+        # Replace NaN with empty string for better display
+        df_receipt = df_receipt.fillna('')
         if not df_receipt.empty:
             blocks.append({
                 'label': 'Receipt Details',
                 'df': df_receipt
             })
     
-    # Block 5: Expenditure Details
+    # Block 5: Expenditure Details - Keep ALL rows and handle Remarks properly
     if structured_data.get("expenditure_details"):
         df_expenditure = pd.DataFrame(structured_data["expenditure_details"])
-        # Clean up the dataframe
-        df_expenditure = df_expenditure.replace('', pd.NA).dropna(how='all').dropna(axis=1, how='all')
+        # Only remove completely empty columns
+        df_expenditure = df_expenditure.dropna(axis=1, how='all')
+        # Replace NaN with empty string
+        df_expenditure = df_expenditure.fillna('')
+        
+        # Ensure Remarks column is preserved if it exists
         if not df_expenditure.empty:
             blocks.append({
                 'label': 'Expenditure Details',
@@ -597,6 +901,12 @@ with col2:
     
     st.info("Structured extraction with 5 sections: Heading, Details, Statements, Receipt table, Expenditure table")
     
+    st.markdown("**Key Features:**")
+    st.markdown("- Hardcoded field extraction (no missing keys)")
+    st.markdown("- Complete statement extraction")
+    st.markdown("- Full table row preservation")
+    st.markdown("- Optimized for speed")
+    
     dpi = st.selectbox(
         "Image Quality (DPI)",
         options=[200, 300, 400],
@@ -652,6 +962,12 @@ if uploaded_pdf:
             progress_bar = st.progress(0)
             status_text = st.empty()
             
+            # Track extraction statistics
+            total_keys_found = 0
+            total_statements = 0
+            total_receipt_rows = 0
+            total_expenditure_rows = 0
+            
             for i, img in enumerate(images):
                 page_num = i + 1
                 status_text.text(f"Processing page {page_num} of {num_pages}...")
@@ -670,6 +986,13 @@ if uploaded_pdf:
                                 'structured': structured_data,
                                 'blocks': blocks
                             }
+                            
+                            # Update statistics
+                            total_keys_found += len([item for item in structured_data.get('two_column_data', []) if item['value']])
+                            total_statements += len(structured_data.get('sentences', []))
+                            total_receipt_rows += len(structured_data.get('receipt_details', []))
+                            total_expenditure_rows += len(structured_data.get('expenditure_details', []))
+                            
                 except Exception as e:
                     st.warning(f"Error processing page {page_num}: {str(e)}")
                     logger.error(f"Page {page_num} processing error: {str(e)}", exc_info=True)
@@ -695,7 +1018,19 @@ if uploaded_pdf:
         st.error("No content detected in the document")
         st.stop()
     
-    st.success(f"Extraction completed: {len(page_data)} page(s) processed")
+    # Show extraction summary
+    st.success(f" Extraction completed: {len(page_data)} page(s) processed")
+    
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Fields Extracted", f"{total_keys_found}/6")
+    with col2:
+        st.metric("Statements", total_statements)
+    with col3:
+        st.metric("Receipt Rows", total_receipt_rows)
+    with col4:
+        st.metric("Expenditure Rows", total_expenditure_rows)
     
     # Display structured data
     st.divider()
@@ -714,9 +1049,6 @@ if uploaded_pdf:
                 
                 # Show formatted blocks
                 for block in data['blocks']:
-                    st.markdown(f"**{block['label']}**")
-                st.dataframe(block['df'], use_container_width=True, height=min(len(block['df']) * 35 + 38, 400))
-                st.markdown("---")
                     st.markdown(f"**{block['label']}**")
                     st.dataframe(block['df'], use_container_width=True, height=min(len(block['df']) * 35 + 38, 400))
                     st.markdown("---")
